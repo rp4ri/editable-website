@@ -1,16 +1,14 @@
 import slugify from 'slugify';
 import { SHORTCUTS } from './constants';
-import Database from 'better-sqlite3';
+import { createClient } from '@libsql/client';
 import { nanoid } from '$lib/util';
 import { DB_PATH, ADMIN_PASSWORD } from '$env/static/private';
 import { Blob } from 'node:buffer';
 
-const db = new Database(DB_PATH, {
-  // verbose: console.log
+const db = createClient({
+  url: DB_PATH,
+  authToken: ADMIN_PASSWORD
 });
-db.pragma('journal_mode = WAL');
-db.pragma('case_sensitive_like = true');
-
 
 /**
  * Creates a new article
@@ -18,68 +16,51 @@ db.pragma('case_sensitive_like = true');
 export async function createArticle(title, content, teaser, currentUser) {
   if (!currentUser) throw new Error('Not authorized');
 
-    let slug = slugify(title, {
-      lower: true,
-      strict: true
-    });
+  let slug = slugify(title, { lower: true, strict: true });
 
-    // If slug is already used, we add a unique postfix
-    const articleExists = db.prepare('SELECT * FROM articles WHERE slug = ?').get(slug);
-    if (articleExists) {
-      slug = slug + '-' + nanoid();
-    }
+  // Check if slug is already used
+  const articleExists = await db.execute('SELECT * FROM articles WHERE slug = ?', [slug]);
+  if (articleExists.rows.length > 0) {
+    slug = slug + '-' + nanoid();
+  }
 
-    db.prepare(`
-        INSERT INTO articles (slug, title, content, teaser, published_at)
-        VALUES(?, ?, ?, ?, DATETIME('now'))
-      `)
-      .run(
-        slug,
-        title,
-        content,
-        teaser
-      );
+  await db.execute(
+    `INSERT INTO articles (slug, title, content, teaser, published_at) VALUES (?, ?, ?, ?, DATETIME('now'))`,
+    [slug, title, content, teaser]
+  );
 
-  const newArticleQuery = "SELECT slug, created_at FROM articles WHERE slug = ?";
-  const newArticle = db.prepare(newArticleQuery).get(slug);
-  return newArticle;
+  const newArticle = await db.execute("SELECT slug, created_at FROM articles WHERE slug = ?", [slug]);
+  return newArticle.rows[0];
 }
 
 /**
- * We automatically extract a teaser text from the document's content.
+ * Updates an article
  */
 export async function updateArticle(slug, title, content, teaser, currentUser) {
   if (!currentUser) throw new Error('Not authorized');
 
-  const query = `
-    UPDATE articles
-    SET title = ?, content = ?, teaser = ?, updated_at = datetime('now')
-    WHERE slug = ?
-  `;
-  const updateStmt = db.prepare(query);
-  updateStmt.run(title, content, teaser, slug);
+  await db.execute(
+    `UPDATE articles SET title = ?, content = ?, teaser = ?, updated_at = datetime('now') WHERE slug = ?`,
+    [title, content, teaser, slug]
+  );
 
-  const updatedArticleQuery = "SELECT slug, updated_at FROM articles WHERE slug = ?";
-  const updatedArticle = db.prepare(updatedArticleQuery).get(slug);
-
-  return updatedArticle;
+  const updatedArticle = await db.execute("SELECT slug, updated_at FROM articles WHERE slug = ?", [slug]);
+  return updatedArticle.rows[0];
 }
 
-/*
-  This can be replaced with any user-based authentication system
-*/
+/**
+ * Authentication
+ */
 export async function authenticate(password, sessionTimeout) {
   const expires = __getDateTimeMinutesAfter(sessionTimeout);
   if (password === ADMIN_PASSWORD) {
     const sessionId = nanoid();
 
-    // Now is a good time to remove expired sessions
-    db.prepare('DELETE FROM sessions WHERE expires < ?').run(new Date().toISOString());
+    await db.execute('DELETE FROM sessions WHERE expires < ?', [new Date().toISOString()]);
 
-    // Create a new session
-    db.prepare('INSERT INTO sessions (session_id, expires) values(?, ?) returning session_id').run(
-      sessionId,
-      expires
+    await db.execute(
+      'INSERT INTO sessions (session_id, expires) VALUES (?, ?)',
+      [sessionId, expires]
     );
 
     return { sessionId };
@@ -88,59 +69,43 @@ export async function authenticate(password, sessionTimeout) {
   }
 }
 
-/*
-  Log out of the admin session ...
-*/
+/**
+ * Destroy session
+ */
 export async function destroySession(sessionId) {
-  db.prepare('DELETE FROM sessions WHERE session_id = ?').run(sessionId);
+  await db.execute('DELETE FROM sessions WHERE session_id = ?', [sessionId]);
   return true;
 }
 
 /**
- * List all available articles (newest first)
+ * Get all articles
  */
 export async function getArticles(currentUser) {
-  let articles;
-  let statement;
-
+  let query;
   if (currentUser) {
-    // When logged in, show both drafts and published articles
-    statement = db.prepare(
-      'SELECT *, COALESCE(published_at, updated_at, created_at) AS modified_at FROM articles ORDER BY modified_at DESC'
-    );
+    query = 'SELECT *, COALESCE(published_at, updated_at, created_at) AS modified_at FROM articles ORDER BY modified_at DESC';
   } else {
-    statement = db.prepare(
-      'SELECT * FROM articles WHERE published_at IS NOT NULL ORDER BY published_at DESC'
-    );
+    query = 'SELECT * FROM articles WHERE published_at IS NOT NULL ORDER BY published_at DESC';
   }
 
-  articles = statement.all();
-  return articles;
+  const articles = await db.execute(query);
+  return articles.rows;
 }
 
 /**
- * Given a slug, determine article to "read next"
+ * Get the next article by slug
  */
 export async function getNextArticle(slug) {
   const query = `
     WITH previous_published AS (
-      SELECT
-        title,
-        teaser,
-        slug,
-        published_at
+      SELECT title, teaser, slug, published_at
       FROM articles
-      WHERE
-        published_at < (SELECT published_at FROM articles WHERE slug = ?)
+      WHERE published_at < (SELECT published_at FROM articles WHERE slug = ?)
       ORDER BY published_at DESC
       LIMIT 1
     ),
     latest_article AS (
-      SELECT
-        title,
-        teaser,
-        slug,
-        published_at
+      SELECT title, teaser, slug, published_at
       FROM articles
       WHERE slug <> ?
       ORDER BY published_at DESC
@@ -156,169 +121,145 @@ export async function getNextArticle(slug) {
     LIMIT 1;
   `;
 
-  const result = db.prepare(query).get(slug, slug);
-  return result;
+  const result = await db.execute(query, [slug, slug]);
+  return result.rows[0];
 }
 
 /**
- * Search within all searchable items (including articles and website sections)
+ * Search articles
  */
 export async function search(q, currentUser) {
   let query;
   if (currentUser) {
-    query = `
-      SELECT title AS name, '/blog/' || slug AS url, COALESCE(published_at, updated_at, created_at) AS modified_at
+    query = `SELECT title AS name, '/blog/' || slug AS url, COALESCE(published_at, updated_at, created_at) AS modified_at
       FROM articles
-      WHERE title LIKE ? COLLATE NOCASE
-      ORDER BY modified_at DESC;
-    `;
+      WHERE title LIKE ? COLLATE NOCASE ORDER BY modified_at DESC`;
   } else {
-    query = `
-      SELECT title AS name, '/blog/' || slug AS url, COALESCE(published_at, updated_at, created_at) AS modified_at
+    query = `SELECT title AS name, '/blog/' || slug AS url, COALESCE(published_at, updated_at, created_at) AS modified_at
       FROM articles
-      WHERE title LIKE ? COLLATE NOCASE AND published_at IS NOT NULL
-      ORDER BY modified_at DESC;
-    `;
+      WHERE title LIKE ? COLLATE NOCASE AND published_at IS NOT NULL ORDER BY modified_at DESC`;
   }
 
-  const results = db.prepare(query).all(`%${q}%`);
+  const results = await db.execute(query, [`%${q}%`]);
+  const rows = results.rows;
 
-  // Also include predefined shortcuts in search
   SHORTCUTS.forEach(shortcut => {
     if (shortcut.name.toLowerCase().includes(q.toLowerCase())) {
-      results.push(shortcut);
+      rows.push(shortcut);
     }
   });
 
-  return results;
+  return rows;
 }
 
 /**
- * Retrieve article based on a given slug
+ * Get article by slug
  */
 export async function getArticleBySlug(slug) {
-  const query = "SELECT * FROM articles WHERE slug = ?";
-  const article = db.prepare(query).get(slug);
-  return article;
+  const result = await db.execute("SELECT * FROM articles WHERE slug = ?", [slug]);
+  return result.rows[0];
 }
 
 /**
- * Remove the entire article
+ * Delete article
  */
 export async function deleteArticle(slug, currentUser) {
   if (!currentUser) throw new Error('Not authorized');
 
-  const query = "DELETE FROM articles WHERE slug = ?";
-  const result = db.prepare(query).run(slug);
-
-  return result.changes > 0;
+  const result = await db.execute("DELETE FROM articles WHERE slug = ?", [slug]);
+  return result.affectedRows > 0;
 }
 
 /**
- * In this minimal setup there is only one user, the website admin.
- * If you want to support multiple users/authors you want to return the current user record here.
- */
-/**
- * In this minimal setup there is only one user, the website admin.
- * If you want to support multiple users/authors you want to return the current user record here.
+ * Get current user by session
  */
 export async function getCurrentUser(session_id) {
-  const stmt = db.prepare(
-    'SELECT session_id, expires FROM sessions WHERE session_id = ? AND expires > ?'
+  const result = await db.execute(
+    'SELECT session_id, expires FROM sessions WHERE session_id = ? AND expires > ?',
+    [session_id, new Date().toISOString()]
   );
-  const session = stmt.get(session_id, new Date().toISOString());
 
-  if (session) {
-    return { name: 'Admin' };
-  } else {
-    return null;
-  }
+  return result.rows.length ? { name: 'Admin' } : null;
 }
 
-
 /**
- * Update the page
+ * Create or update page
  */
 export async function createOrUpdatePage(page_id, page, currentUser) {
   if (!currentUser) throw new Error('Not authorized');
-  const pageExists = db.prepare('SELECT page_id FROM pages WHERE page_id = ?').get(page_id);
-  if (pageExists) {
-    return db
-      .prepare('UPDATE pages SET data = ?, updated_at = ? WHERE page_id = ? RETURNING page_id')
-      .get(JSON.stringify(page), new Date().toISOString(), page_id);
+  const pageExists = await db.execute('SELECT page_id FROM pages WHERE page_id = ?', [page_id]);
+  
+  if (pageExists.rows.length) {
+    return (await db.execute(
+      'UPDATE pages SET data = ?, updated_at = ? WHERE page_id = ? RETURNING page_id',
+      [JSON.stringify(page), new Date().toISOString(), page_id]
+    )).rows[0];
   } else {
-    return db
-      .prepare('INSERT INTO pages (page_id, data, updated_at) values(?, ?, ?) RETURNING page_id')
-      .get(page_id, JSON.stringify(page), new Date().toISOString());
+    return (await db.execute(
+      'INSERT INTO pages (page_id, data, updated_at) VALUES (?, ?, ?) RETURNING page_id',
+      [page_id, JSON.stringify(page), new Date().toISOString()]
+    )).rows[0];
   }
 }
 
 /**
- * E.g. getPage("home") gets all dynamic data for the home page
+ * Get page by ID
  */
 export async function getPage(page_id) {
-  const page = db.prepare('SELECT data FROM pages WHERE page_id = ?').get(page_id);
-  if (page?.data) {
-    return JSON.parse(page.data);
+  const page = await db.execute('SELECT data FROM pages WHERE page_id = ?', [page_id]);
+  return page.rows[0] ? JSON.parse(page.rows[0].data) : null;
+}
+
+/**
+ * Create or update counter
+ */
+export async function createOrUpdateCounter(counter_id) {
+  const counterExists = await db.execute('SELECT counter_id FROM counters WHERE counter_id = ?', [counter_id]);
+  
+  if (counterExists.rows.length) {
+    return (await db.execute(
+      'UPDATE counters SET count = count + 1 WHERE counter_id = ? RETURNING count',
+      [counter_id]
+    )).rows[0];
   } else {
-    return null;
+    return (await db.execute(
+      'INSERT INTO counters (counter_id, count) VALUES (?, 1) RETURNING count',
+      [counter_id]
+    )).rows[0];
   }
 }
 
 /**
- * We can count all kinds of things with this.
+ * Store an asset
  */
-export async function createOrUpdateCounter(counter_id) {
-  return db.transaction(() => {
-    // Remove recipients associated with the friend if there are any entries
-    const counter_exists = db
-      .prepare('SELECT counter_id FROM counters WHERE counter_id = ?')
-      .get(counter_id);
-    if (counter_exists) {
-      return db
-        .prepare('UPDATE counters SET count = count + 1 WHERE counter_id = ? RETURNING count')
-        .get(counter_id);
-    } else {
-      return db
-        .prepare('INSERT INTO counters (counter_id, count) values(?, 1) RETURNING count')
-        .get(counter_id);
-    }
-  })();
-}
-
-// asset_id is a string and has the form path
 export async function storeAsset(asset_id, file) {
   const arrayBuffer = await file.arrayBuffer();
   const buffer = Buffer.from(arrayBuffer);
 
   const sql = `
-  INSERT into assets (asset_id, mime_type, updated_at, size, data) VALUES (?, ?, ?, ?, ?)
-  ON CONFLICT (asset_id) DO
-  UPDATE
-     SET mime_type = excluded.mime_type,
-         updated_at = excluded.updated_at,
-         size = excluded.size,
-         data = excluded.data
-  WHERE asset_id = excluded.asset_id
+    INSERT INTO assets (asset_id, mime_type, updated_at, size, data)
+    VALUES (?, ?, ?, ?, ?)
+    ON CONFLICT (asset_id) DO UPDATE SET
+      mime_type = excluded.mime_type,
+      updated_at = excluded.updated_at,
+      size = excluded.size,
+      data = excluded.data
+    WHERE asset_id = excluded.asset_id
   `;
-  const stmnt = db.prepare(sql);
-  stmnt.run(asset_id, file.type, new Date().toISOString(), file.size, buffer);
+  await db.execute(sql, [asset_id, file.type, new Date().toISOString(), file.size, buffer]);
 }
 
-export function getAsset(asset_id) {
-  const sql = `
-  SELECT
-    asset_id,
-    mime_type,
-    updated_at,
-    size,
-    data
-  FROM assets
-  WHERE asset_id = ?
-  `;
+/**
+ * Get asset by ID
+ */
+export async function getAsset(asset_id) {
+  const result = await db.execute(`
+    SELECT asset_id, mime_type, updated_at, size, data
+    FROM assets
+    WHERE asset_id = ?
+  `, [asset_id]);
 
-  const stmnt = db.prepare(sql);
-  const row = stmnt.get(asset_id);
+  const row = result.rows[0];
   return {
     filename: row.asset_id.split('/').slice(-1),
     mimeType: row.mime_type,
@@ -332,5 +273,5 @@ export function getAsset(asset_id) {
  * Helpers
  */
 function __getDateTimeMinutesAfter(minutes) {
-  return new Date(new Date().getTime() + minutes * 60000).toISOString();
+  return new Date(Date.now() + minutes * 60000).toISOString();
 }
